@@ -1,15 +1,15 @@
 """
 DC Apartment Scraper
-Scrapes Craigslist, Zillow, and Apartments.com for DC rentals
+Scrapes Craigslist, Zillow, and Realtor.com for DC rentals
 and pushes new listings to Google Sheets.
 """
 
 import requests
 import gspread
-import json
 import time
 import re
 import logging
+import urllib.parse
 from datetime import datetime
 from bs4 import BeautifulSoup
 from oauth2client.service_account import ServiceAccountCredentials
@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 
 SHEET_HEADERS = [
-    "Date Added", "Source", "Title", "Price", "Beds", "Address", "Link", "Status"
+    "Date Added", "Source", "Title", "Price", "Beds", "Baths", "Address", "Link", "Status"
 ]
 
 
@@ -49,7 +49,7 @@ def get_sheet():
 
 def get_existing_links(sheet):
     try:
-        links = sheet.col_values(7)  # Column G = Link
+        links = sheet.col_values(8)  # Column H = Link
         return set(links[1:])        # Skip header
     except Exception as e:
         logging.error(f"Error fetching existing links: {e}")
@@ -59,13 +59,12 @@ def get_existing_links(sheet):
 def ensure_headers(sheet):
     first_row = sheet.row_values(1)
     if first_row != SHEET_HEADERS:
+        sheet.clear()
         sheet.insert_row(SHEET_HEADERS, 1)
-        # Format header row bold
-        sheet.format("A1:H1", {
+        sheet.format("A1:I1", {
             "textFormat": {"bold": True},
             "backgroundColor": {"red": 0.2, "green": 0.4, "blue": 0.7},
         })
-        # Freeze header row
         sheet.freeze(rows=1)
 
 
@@ -79,6 +78,7 @@ def append_listings(sheet, listings, existing_links):
                 listing["title"],
                 listing["price"],
                 listing["beds"],
+                listing["baths"],
                 listing["address"],
                 listing["link"],
                 "New",
@@ -86,7 +86,7 @@ def append_listings(sheet, listings, existing_links):
             sheet.append_row(row)
             existing_links.add(listing["link"])
             new_count += 1
-            time.sleep(0.5)  # avoid rate limiting Sheets API
+            time.sleep(0.5)
     return new_count
 
 
@@ -96,9 +96,9 @@ def scrape_craigslist():
     listings = []
     base_url = "https://washingtondc.craigslist.org/search/apa"
     params = {
-        "min_price":    MIN_PRICE,
-        "max_price":    MAX_PRICE,
-        "min_bedrooms": MIN_BEDS,
+        "min_price":        MIN_PRICE,
+        "max_price":        MAX_PRICE,
+        "min_bedrooms":     MIN_BEDS,
         "availabilityMode": 0,
     }
     headers = {
@@ -114,13 +114,11 @@ def scrape_craigslist():
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Try current Craigslist HTML structure (as of 2025-2026)
         results = soup.select("li.cl-search-result, li[data-pid]")
         logging.info(f"Craigslist: found {len(results)} raw results")
 
         for item in results:
             try:
-                # Title & link — try multiple possible selectors
                 link_el = (
                     item.select_one("a.cl-app-anchor") or
                     item.select_one("a.posting-title") or
@@ -147,12 +145,13 @@ def scrape_craigslist():
                 link  = link_el["href"] if link_el and link_el.get("href") else ""
                 meta  = meta_el.get_text(" ", strip=True) if meta_el else ""
 
-                # Ensure absolute URL
                 if link and link.startswith("/"):
                     link = "https://washingtondc.craigslist.org" + link
 
-                beds_match = re.search(r"(\d+)\s*br", meta, re.IGNORECASE)
-                beds = beds_match.group(1) + "br" if beds_match else "N/A"
+                beds_match  = re.search(r"(\d+)\s*br",       meta, re.IGNORECASE)
+                baths_match = re.search(r"(\d+\.?\d*)\s*ba", meta, re.IGNORECASE)
+                beds  = beds_match.group(1)  + "br" if beds_match  else "N/A"
+                baths = baths_match.group(1) + "ba" if baths_match else "N/A"
 
                 addr_match = re.search(r"[·\-]\s*(.{5,60})$", meta)
                 address = addr_match.group(1).strip() if addr_match else "Washington, DC"
@@ -163,6 +162,7 @@ def scrape_craigslist():
                         "title":   title,
                         "price":   price,
                         "beds":    beds,
+                        "baths":   baths,
                         "address": address,
                         "link":    link,
                     })
@@ -170,7 +170,6 @@ def scrape_craigslist():
                 logging.warning(f"Craigslist parse error on item: {e}")
                 continue
 
-        # Log a snippet of the HTML if still 0 results, for debugging
         if not listings:
             snippet = resp.text[:500].replace("\n", " ")
             logging.warning(f"Craigslist 0 results. HTML snippet: {snippet}")
@@ -187,9 +186,6 @@ def scrape_craigslist():
 def scrape_zillow():
     listings = []
 
-    # Build a Zillow for-rent search URL for Washington DC with filters
-    # This encodes: forRent=true, price range, min beds, Washington DC region
-    import urllib.parse
     search_state = {
         "isMapVisible": True,
         "filterState": {
@@ -210,7 +206,12 @@ def scrape_zillow():
     }
     zillow_url = (
         "https://www.zillow.com/washington-dc/rentals/?"
-        "searchQueryState=" + urllib.parse.quote(str(search_state).replace("'", '"').replace("True", "true").replace("False", "false"))
+        "searchQueryState=" + urllib.parse.quote(
+            str(search_state)
+            .replace("'", '"')
+            .replace("True", "true")
+            .replace("False", "false")
+        )
     )
 
     url = "https://real-estate101.p.rapidapi.com/api/search/byurl"
@@ -236,8 +237,10 @@ def scrape_zillow():
                 zpid    = p.get("zpid", "")
                 address = p.get("address", p.get("addressStreet", "Washington, DC"))
                 price   = p.get("price", p.get("unformattedPrice", "N/A"))
-                beds    = p.get("beds", p.get("bedrooms", None))
-                beds    = f"{beds}br" if beds else "N/A"
+                beds    = p.get("beds",  p.get("bedrooms",  None))
+                baths   = p.get("baths", p.get("bathrooms", None))
+                beds    = f"{beds}br"  if beds  else "N/A"
+                baths   = f"{baths}ba" if baths else "N/A"
                 link    = p.get("detailUrl", p.get("url", ""))
 
                 if link and not link.startswith("http"):
@@ -254,51 +257,7 @@ def scrape_zillow():
                         "title":   address,
                         "price":   str(price),
                         "beds":    beds,
-                        "address": address,
-                        "link":    link,
-                    })
-            except Exception as e:
-                logging.warning(f"Zillow parse error on item: {e}")
-                continue
-
-    except Exception as e:
-        logging.error(f"Zillow scrape failed: {e}")
-
-    logging.info(f"Zillow: returning {len(listings)} listings")
-    return listings
-
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-
-        props = data.get("results", data.get("props", []))
-        logging.info(f"Zillow: found {len(props)} raw results")
-
-        for p in props:
-            try:
-                zpid    = p.get("zpid", "")
-                address = p.get("address", "Washington, DC")
-                price   = p.get("price", p.get("unformattedPrice", "N/A"))
-                beds    = p.get("bedrooms", None)
-                beds    = f"{beds}br" if beds else "N/A"
-                link    = p.get("detailUrl", "")
-
-                # detailUrl is sometimes relative
-                if link and not link.startswith("http"):
-                    link = "https://www.zillow.com" + link
-                elif not link and zpid:
-                    link = f"https://www.zillow.com/homedetails/{zpid}_zpid/"
-
-                if isinstance(price, (int, float)):
-                    price = f"${price:,}/mo"
-
-                if link:
-                    listings.append({
-                        "source":  "Zillow",
-                        "title":   address,
-                        "price":   str(price),
-                        "beds":    beds,
+                        "baths":   baths,
                         "address": address,
                         "link":    link,
                     })
@@ -333,45 +292,54 @@ def scrape_realtor():
         resp.raise_for_status()
         data = resp.json()
 
-        results = data.get("properties", data.get("data", data.get("results", data.get("homes", []))))
+        results = data.get("data", {}).get("results", [])
         logging.info(f"Realtor.com: found {len(results)} raw results")
 
         for item in results:
             try:
                 # Address
-                loc  = item.get("location", item)
+                loc  = item.get("location", {})
                 addr = loc.get("address", {}) if isinstance(loc, dict) else {}
                 if isinstance(addr, dict):
-                    street  = addr.get("line",       addr.get("street", ""))
-                    city    = addr.get("city",        "Washington")
-                    state   = addr.get("state_code",  "DC")
+                    street  = addr.get("line",      addr.get("street", ""))
+                    city    = addr.get("city",       "Washington")
+                    state   = addr.get("state_code", "DC")
                     address = f"{street}, {city}, {state}".strip(", ")
                 else:
                     address = str(addr) if addr else "Washington, DC"
 
-                # Price — filter client-side since API doesn't support price params
-                price_raw = item.get("list_price", item.get("price", item.get("rent", None)))
+                # Price
+                price_raw = item.get("list_price", None)
                 if isinstance(price_raw, (int, float)):
                     if price_raw < MIN_PRICE or price_raw > MAX_PRICE:
                         continue
-                    price = f"${price_raw:,}/mo"
+                    price = f"${int(price_raw):,}/mo"
                 else:
-                    price = str(price_raw or "N/A")
+                    price = "N/A"
 
-                # Beds — filter client-side too
-                desc     = item.get("description", item)
-                beds_raw = desc.get("beds", item.get("beds", None)) if isinstance(desc, dict) else item.get("beds", None)
-                if beds_raw and isinstance(beds_raw, (int, float)) and beds_raw < MIN_BEDS:
+                # Beds & Baths
+                desc      = item.get("description", {})
+                beds_raw  = desc.get("beds",  None) if isinstance(desc, dict) else None
+                baths_raw = desc.get("baths", desc.get("baths_consolidated", None)) if isinstance(desc, dict) else None
+
+                if isinstance(beds_raw, (int, float)) and beds_raw < MIN_BEDS:
                     continue
-                beds = f"{beds_raw}br" if beds_raw else "N/A"
+
+                beds  = f"{int(beds_raw)}br"  if beds_raw  else "N/A"
+                baths = f"{int(baths_raw)}ba" if baths_raw else "N/A"
 
                 # Title
                 prop_type = desc.get("type", "Rental") if isinstance(desc, dict) else "Rental"
                 title = f"{prop_type.replace('_', ' ').title()} — {address}"
 
                 # Link
-                permalink = item.get("permalink", item.get("property_id", item.get("id", "")))
-                link = f"https://www.realtor.com/realestateandhomes-detail/{permalink}" if permalink else ""
+                property_id = item.get("property_id", "")
+                permalink   = item.get("permalink", "")
+                link = (
+                    f"https://www.realtor.com/realestateandhomes-detail/{permalink}" if permalink
+                    else f"https://www.realtor.com/realestateandhomes-detail/{property_id}" if property_id
+                    else ""
+                )
 
                 if link:
                     listings.append({
@@ -379,6 +347,7 @@ def scrape_realtor():
                         "title":   title,
                         "price":   price,
                         "beds":    beds,
+                        "baths":   baths,
                         "address": address,
                         "link":    link,
                     })
@@ -419,9 +388,9 @@ def main():
         all_listings.extend(zl)
 
         print("🔍 Scraping Realtor.com...")
-        ap = scrape_realtor()
-        print(f"   → {len(ap)} listings found")
-        all_listings.extend(ap)
+        rl = scrape_realtor()
+        print(f"   → {len(rl)} listings found")
+        all_listings.extend(rl)
     else:
         print("⚠️  Skipping Zillow & Realtor.com (no RapidAPI key set in config.py)")
 
